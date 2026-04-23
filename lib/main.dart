@@ -1,10 +1,15 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_contacts/flutter_contacts.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:flutter_timezone/flutter_timezone.dart';
+import 'package:photo_manager/photo_manager.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:timezone/data/latest.dart' as tz_data;
 import 'package:timezone/timezone.dart' as tz;
 
@@ -63,9 +68,11 @@ class AlarmDashboardScreen extends StatefulWidget {
 
 class _AlarmDashboardScreenState extends State<AlarmDashboardScreen> {
   static const _prefsKey = 'alarm_items_v1';
+  static const _blastConfigKey = 'image_blast_config_v1';
 
   final Map<String, DateTime> _snoozedUntil = {};
   final Set<String> _minuteLocks = {};
+  final Map<String, DateTime> _penaltyLocks = {};
 
   List<AlarmItem> _alarms = [];
   DateTime _now = DateTime.now();
@@ -76,6 +83,14 @@ class _AlarmDashboardScreenState extends State<AlarmDashboardScreen> {
 
   bool _loading = true;
   String? _loadingError;
+
+  final Random _random = Random();
+  bool _imageBlastPenaltyEnabled = true;
+  bool _sendingBlast = false;
+  String? _lastBlastStatus;
+  final List<PenaltyContact> _approvedContacts = [];
+  final List<PenaltyImage> _penaltyImagePool = [];
+  final List<ImageBlastDispatch> _blastHistory = [];
 
   @override
   void initState() {
@@ -101,6 +116,7 @@ class _AlarmDashboardScreenState extends State<AlarmDashboardScreen> {
       );
 
       final loadedAlarms = await _loadAlarms();
+      await _loadBlastConfig();
 
       if (!mounted) {
         return;
@@ -273,6 +289,25 @@ class _AlarmDashboardScreenState extends State<AlarmDashboardScreen> {
                                   );
                                 },
                               ),
+                              const SizedBox(height: 12),
+                              _SnoozeBlastCard(
+                                enabled: _imageBlastPenaltyEnabled,
+                                contactCount: _approvedContacts.length,
+                                imageCount: _penaltyImagePool.length,
+                                latestDispatch: _blastHistory.isEmpty
+                                    ? null
+                                    : _blastHistory.first,
+                                sending: _sendingBlast,
+                                lastStatus: _lastBlastStatus,
+                                onEnabledChanged: (enabled) {
+                                  setState(() {
+                                    _imageBlastPenaltyEnabled = enabled;
+                                  });
+                                  unawaited(_persistBlastConfig());
+                                },
+                                onManageContactsTap: _openContactPoolSheet,
+                                onManageImagesTap: _openImagePoolSheet,
+                              ),
                               const SizedBox(height: 18),
                               Text(
                                 'Alarms',
@@ -397,7 +432,79 @@ class _AlarmDashboardScreenState extends State<AlarmDashboardScreen> {
 
   Future<void> _saveAndSync() async {
     await _persistAlarms();
+    await _persistBlastConfig();
     await _syncSystemAlarms();
+  }
+
+  Future<void> _loadBlastConfig() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_blastConfigKey);
+      if (raw == null || raw.isEmpty) {
+        return;
+      }
+
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map<String, dynamic>) {
+        return;
+      }
+
+      final enabled = decoded['enabled'] as bool?;
+      final contacts = decoded['contacts'];
+      final images = decoded['images'];
+
+      if (enabled != null) {
+        _imageBlastPenaltyEnabled = enabled;
+      }
+      if (contacts is List) {
+        final parsedContacts = contacts
+            .whereType<Map>()
+            .map(
+              (value) =>
+                  PenaltyContact.fromJson(Map<String, dynamic>.from(value)),
+            )
+            .toList();
+        if (parsedContacts.isNotEmpty) {
+          _approvedContacts
+            ..clear()
+            ..addAll(parsedContacts);
+        }
+      }
+
+      if (images is List) {
+        final parsedImages = images
+            .whereType<Map>()
+            .map(
+              (value) =>
+                  PenaltyImage.fromJson(Map<String, dynamic>.from(value)),
+            )
+            .toList();
+        if (parsedImages.isNotEmpty) {
+          _penaltyImagePool
+            ..clear()
+            ..addAll(parsedImages);
+        }
+      }
+
+    } catch (_) {
+      // keep defaults on malformed local data
+    }
+  }
+
+  Future<void> _persistBlastConfig() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final payload = {
+        'enabled': _imageBlastPenaltyEnabled,
+        'contacts': _approvedContacts
+            .map((contact) => contact.toJson())
+            .toList(),
+        'images': _penaltyImagePool.map((image) => image.toJson()).toList(),
+      };
+      await prefs.setString(_blastConfigKey, jsonEncode(payload));
+    } catch (_) {
+      // keep app operational if persistence fails
+    }
   }
 
   Future<void> _persistAlarms() async {
@@ -438,6 +545,7 @@ class _AlarmDashboardScreenState extends State<AlarmDashboardScreen> {
       if (match.isEmpty) {
         return;
       }
+      unawaited(_runImageBlastPenalty(match.first));
       final snoozeTime = DateTime.now().add(const Duration(minutes: 5));
       _snoozedUntil[alarmId] = snoozeTime;
       unawaited(
@@ -540,8 +648,9 @@ class _AlarmDashboardScreenState extends State<AlarmDashboardScreen> {
       return;
     }
 
+    final enabledCount = _imageBlastPenaltyEnabled ? 1 : 0;
     final message = info.pluginAvailable
-        ? 'Notifications are active. Scheduled alarms: ${info.pendingCount ?? 0}.'
+        ? 'Alerts are on • alarms ${info.pendingCount ?? 0} • rules $enabledCount/1.'
         : 'Notifications are unavailable on this run. Full restart usually fixes this.';
 
     ScaffoldMessenger.of(
@@ -564,12 +673,648 @@ class _AlarmDashboardScreenState extends State<AlarmDashboardScreen> {
     if (current == null) {
       return;
     }
+    unawaited(_runImageBlastPenalty(current));
     final snoozeTime = DateTime.now().add(const Duration(minutes: 5));
     setState(() {
       _snoozedUntil[current.id] = snoozeTime;
       _ringingAlarm = null;
     });
     unawaited(AlarmScheduler.instance.scheduleSnooze(current, snoozeTime));
+  }
+
+  Future<void> _runImageBlastPenalty(AlarmItem alarm) async {
+    if (!_imageBlastPenaltyEnabled) {
+      return;
+    }
+    final minuteBucket = DateTime.now().millisecondsSinceEpoch ~/ 60000;
+    final lockKey = 'image-${alarm.id}-$minuteBucket';
+    if (!_acquirePenaltyLock(lockKey)) {
+      return;
+    }
+    final contactsSource = List<PenaltyContact>.from(_approvedContacts);
+    final imagesSource = List<PenaltyImage>.from(_penaltyImagePool);
+
+    if (contactsSource.length < 5) {
+      final deviceContacts = await _fetchRandomContactsFromDevice(5);
+      for (final contact in deviceContacts) {
+        if (contactsSource.any(
+          (existing) =>
+              _normalizeHandle(existing.handle) ==
+              _normalizeHandle(contact.handle),
+        )) {
+          continue;
+        }
+        contactsSource.add(contact);
+      }
+    }
+
+    if (imagesSource.length < 5) {
+      final deviceImages = await _fetchRandomImagesFromDevice(5);
+      for (final image in deviceImages) {
+        if (imagesSource.any((existing) => existing.url == image.url)) {
+          continue;
+        }
+        imagesSource.add(image);
+      }
+    }
+
+    if (contactsSource.length < 5 || imagesSource.length < 5) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Need access to at least 5 contacts and 5 photos for image blast.',
+          ),
+        ),
+      );
+      return;
+    }
+
+    final contacts = _pickRandomUnique(contactsSource, 5);
+    final images = _pickRandomUnique(imagesSource, 5);
+    final targets = List<ImageBlastTarget>.generate(
+      5,
+      (index) =>
+          ImageBlastTarget(contact: contacts[index], image: images[index]),
+    );
+
+    final dispatch = ImageBlastDispatch(
+      id: DateTime.now().microsecondsSinceEpoch.toString(),
+      alarmLabel: alarm.label,
+      triggeredAt: DateTime.now(),
+      targets: targets,
+      deliveredCount: 0,
+      failedCount: 0,
+      status: 'queued',
+    );
+
+    setState(() {
+      _blastHistory.insert(0, dispatch);
+      if (_blastHistory.length > 10) {
+        _blastHistory.removeLast();
+      }
+    });
+
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Snooze penalty fired: 5x5 blast queued.')),
+    );
+
+    await _sendImageBlastViaSms(dispatch);
+  }
+
+  Future<void> _sendImageBlastViaSms(ImageBlastDispatch dispatch) async {
+    setState(() {
+      _sendingBlast = true;
+      _replaceDispatch(dispatch.copyWith(status: 'sending'));
+    });
+
+    final recipients = dispatch.targets
+        .map((target) => _normalizePhoneForSms(target.contact.handle))
+        .where((value) => value.isNotEmpty)
+        .toList();
+
+    if (recipients.isEmpty) {
+      setState(() {
+        _sendingBlast = false;
+        _lastBlastStatus =
+            'Could not find valid phone numbers in selected contacts.';
+        _replaceDispatch(dispatch.copyWith(status: 'failed', failedCount: 5));
+      });
+      return;
+    }
+
+    final body = StringBuffer('Morning Menace snooze drop\n\n');
+    for (final target in dispatch.targets) {
+      final imageRef = target.image.isLocal
+          ? target.image.name
+          : target.image.url;
+      body.writeln('${target.contact.name}: $imageRef');
+    }
+
+    final launched = await _openSmsComposer(recipients, body.toString());
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _sendingBlast = false;
+      if (launched) {
+        _lastBlastStatus =
+            'Opened Messages with selected contacts. Tap Send to complete.';
+        _replaceDispatch(
+          dispatch.copyWith(
+            status: 'partial',
+            deliveredCount: recipients.length,
+          ),
+        );
+      } else {
+        _lastBlastStatus = 'Could not open Messages app on this device.';
+        _replaceDispatch(dispatch.copyWith(status: 'failed', failedCount: 5));
+      }
+    });
+  }
+
+
+  void _replaceDispatch(ImageBlastDispatch updated) {
+    final index = _blastHistory.indexWhere((item) => item.id == updated.id);
+    if (index == -1) {
+      return;
+    }
+    _blastHistory[index] = updated;
+  }
+
+  List<T> _pickRandomUnique<T>(List<T> source, int count) {
+    final shuffled = List<T>.from(source)..shuffle(_random);
+    return shuffled.take(count).toList();
+  }
+
+  Future<List<PenaltyContact>> _fetchRandomContactsFromDevice(
+    int needed,
+  ) async {
+    try {
+      final granted = await FlutterContacts.requestPermission(readonly: true);
+      if (!granted) {
+        return const [];
+      }
+
+      final contacts = await FlutterContacts.getContacts(
+        withProperties: true,
+        withPhoto: false,
+      );
+
+      final pool = <PenaltyContact>[];
+      for (final contact in contacts) {
+        for (final phone in contact.phones) {
+          final number = phone.number.trim();
+          if (number.isEmpty) {
+            continue;
+          }
+          final name = contact.displayName.trim().isEmpty
+              ? 'Device Contact'
+              : contact.displayName.trim();
+          pool.add(PenaltyContact(name: name, handle: number));
+        }
+      }
+
+      if (pool.isEmpty) {
+        return const [];
+      }
+      return _pickRandomUnique(pool, min(needed, pool.length));
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  Future<List<PenaltyImage>> _fetchRandomImagesFromDevice(int needed) async {
+    try {
+      final permission = await PhotoManager.requestPermissionExtend();
+      if (!permission.isAuth) {
+        return const [];
+      }
+
+      final paths = await PhotoManager.getAssetPathList(
+        type: RequestType.image,
+        onlyAll: true,
+      );
+      if (paths.isEmpty) {
+        return const [];
+      }
+
+      final assets = await paths.first.getAssetListPaged(page: 0, size: 500);
+      if (assets.isEmpty) {
+        return const [];
+      }
+
+      final picked = _pickRandomUnique(assets, min(needed, assets.length));
+      final images = <PenaltyImage>[];
+      for (final asset in picked) {
+        final file = await asset.file;
+        if (file == null) {
+          continue;
+        }
+        images.add(
+          PenaltyImage(
+            name: _filenameFromPath(file.path),
+            url: file.path,
+            isLocal: true,
+          ),
+        );
+      }
+      return images;
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  bool _acquirePenaltyLock(String key) {
+    final now = DateTime.now();
+    _penaltyLocks.removeWhere(
+      (_, timestamp) => now.difference(timestamp) > const Duration(minutes: 2),
+    );
+    if (_penaltyLocks.containsKey(key)) {
+      return false;
+    }
+    _penaltyLocks[key] = now;
+    return true;
+  }
+
+  Future<void> _openContactPoolSheet() async {
+    final nameController = TextEditingController();
+    final handleController = TextEditingController();
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            return Padding(
+              padding: EdgeInsets.only(
+                left: 12,
+                right: 12,
+                top: 12,
+                bottom: MediaQuery.of(context).viewInsets.bottom + 12,
+              ),
+              child: Container(
+                padding: const EdgeInsets.all(16),
+                decoration: _brutalDecoration(
+                  color: _Palette.paper,
+                  borderRadius: 16,
+                  shadowOffset: const Offset(6, 6),
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Approved contacts',
+                      style: Theme.of(
+                        context,
+                      ).textTheme.titleLarge?.copyWith(color: _Palette.ink),
+                    ),
+                    const SizedBox(height: 8),
+                    ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxHeight: MediaQuery.of(context).size.height * 0.24,
+                      ),
+                      child: ListView.builder(
+                        shrinkWrap: true,
+                        itemCount: _approvedContacts.length,
+                        itemBuilder: (_, index) {
+                          final contact = _approvedContacts[index];
+                          return Row(
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  '${contact.name} • ${contact.handle}',
+                                  style: Theme.of(context).textTheme.bodySmall
+                                      ?.copyWith(color: _Palette.surface),
+                                ),
+                              ),
+                              IconButton(
+                                onPressed: () {
+                                  if (_approvedContacts.length <= 5) {
+                                    return;
+                                  }
+                                  setState(() {
+                                    _approvedContacts.remove(contact);
+                                  });
+                                  setModalState(() {});
+                                  unawaited(_persistBlastConfig());
+                                },
+                                icon: const Icon(Icons.delete_outline_rounded),
+                              ),
+                            ],
+                          );
+                        },
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    _PressButton(
+                      text: 'Add from device contacts',
+                      color: _Palette.paper,
+                      textColor: _Palette.ink,
+                      onTap: () {
+                        unawaited(_importContactFromDevice());
+                      },
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: nameController,
+                      decoration: const InputDecoration(
+                        hintText: 'Contact name',
+                        isDense: true,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    TextField(
+                      controller: handleController,
+                      decoration: const InputDecoration(
+                        hintText: 'Phone, email, or handle',
+                        isDense: true,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    _PressButton(
+                      text: 'Add contact',
+                      color: _Palette.blood,
+                      textColor: _Palette.paper,
+                      onTap: () {
+                        final name = nameController.text.trim();
+                        final handle = handleController.text.trim();
+                        if (name.isEmpty || handle.isEmpty) {
+                          return;
+                        }
+                        setState(() {
+                          _approvedContacts.add(
+                            PenaltyContact(name: name, handle: handle),
+                          );
+                        });
+                        setModalState(() {
+                          nameController.clear();
+                          handleController.clear();
+                        });
+                        unawaited(_persistBlastConfig());
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+    nameController.dispose();
+    handleController.dispose();
+  }
+
+  Future<void> _openImagePoolSheet() async {
+    final nameController = TextEditingController();
+    final urlController = TextEditingController();
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            return Padding(
+              padding: EdgeInsets.only(
+                left: 12,
+                right: 12,
+                top: 12,
+                bottom: MediaQuery.of(context).viewInsets.bottom + 12,
+              ),
+              child: Container(
+                padding: const EdgeInsets.all(16),
+                decoration: _brutalDecoration(
+                  color: _Palette.paper,
+                  borderRadius: 16,
+                  shadowOffset: const Offset(6, 6),
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Image pool',
+                      style: Theme.of(
+                        context,
+                      ).textTheme.titleLarge?.copyWith(color: _Palette.ink),
+                    ),
+                    const SizedBox(height: 8),
+                    ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxHeight: MediaQuery.of(context).size.height * 0.24,
+                      ),
+                      child: ListView.builder(
+                        shrinkWrap: true,
+                        itemCount: _penaltyImagePool.length,
+                        itemBuilder: (_, index) {
+                          final image = _penaltyImagePool[index];
+                          return Row(
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  '${image.name} • ${image.isLocal ? 'Device photo' : image.url}',
+                                  overflow: TextOverflow.ellipsis,
+                                  style: Theme.of(context).textTheme.bodySmall
+                                      ?.copyWith(color: _Palette.surface),
+                                ),
+                              ),
+                              IconButton(
+                                onPressed: () {
+                                  if (_penaltyImagePool.length <= 5) {
+                                    return;
+                                  }
+                                  setState(() {
+                                    _penaltyImagePool.remove(image);
+                                  });
+                                  setModalState(() {});
+                                  unawaited(_persistBlastConfig());
+                                },
+                                icon: const Icon(Icons.delete_outline_rounded),
+                              ),
+                            ],
+                          );
+                        },
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    _PressButton(
+                      text: 'Import from device gallery',
+                      color: _Palette.paper,
+                      textColor: _Palette.ink,
+                      onTap: () {
+                        unawaited(_importImagesFromDevice());
+                      },
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: nameController,
+                      decoration: const InputDecoration(
+                        hintText: 'Image label',
+                        isDense: true,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    TextField(
+                      controller: urlController,
+                      decoration: const InputDecoration(
+                        hintText: 'https://...',
+                        isDense: true,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    _PressButton(
+                      text: 'Add image URL',
+                      color: _Palette.blood,
+                      textColor: _Palette.paper,
+                      onTap: () {
+                        final name = nameController.text.trim();
+                        final url = urlController.text.trim();
+                        final uri = Uri.tryParse(url);
+                        if (name.isEmpty || url.isEmpty || uri == null) {
+                          return;
+                        }
+                        setState(() {
+                          _penaltyImagePool.add(
+                            PenaltyImage(name: name, url: url),
+                          );
+                        });
+                        setModalState(() {
+                          nameController.clear();
+                          urlController.clear();
+                        });
+                        unawaited(_persistBlastConfig());
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+    nameController.dispose();
+    urlController.dispose();
+  }
+
+  Future<void> _importContactFromDevice() async {
+    try {
+      final contacts = await _fetchRandomContactsFromDevice(1);
+      if (contacts.isEmpty) {
+        if (!mounted) {
+          return;
+        }
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No readable device contacts available.'),
+          ),
+        );
+        return;
+      }
+
+      final picked = contacts.first;
+      final normalized = _normalizeHandle(picked.handle);
+      final exists = _approvedContacts.any(
+        (entry) => _normalizeHandle(entry.handle) == normalized,
+      );
+      if (exists) {
+        if (!mounted) {
+          return;
+        }
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Contact already in approved pool.')),
+        );
+        return;
+      }
+
+      setState(() {
+        _approvedContacts.add(picked);
+      });
+      await _persistBlastConfig();
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Could not read device contact. Check permission.'),
+        ),
+      );
+    }
+  }
+
+  Future<void> _importImagesFromDevice() async {
+    try {
+      final picker = ImagePicker();
+      final selected = await picker.pickMultiImage(
+        imageQuality: 85,
+        maxWidth: 1800,
+      );
+      if (selected.isEmpty) {
+        return;
+      }
+
+      var added = 0;
+      for (final file in selected) {
+        final path = file.path.trim();
+        if (path.isEmpty) {
+          continue;
+        }
+        final exists = _penaltyImagePool.any((image) => image.url == path);
+        if (exists) {
+          continue;
+        }
+        _penaltyImagePool.add(
+          PenaltyImage(name: _filenameFromPath(path), url: path, isLocal: true),
+        );
+        added += 1;
+      }
+
+      if (added > 0) {
+        setState(() {});
+        await _persistBlastConfig();
+      }
+
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Imported $added images from gallery.')),
+      );
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Could not import gallery images. Check permission.'),
+        ),
+      );
+    }
+  }
+
+  String _filenameFromPath(String path) {
+    final normalized = path.replaceAll('\\', '/');
+    final last = normalized.split('/').last;
+    return last.isEmpty ? 'device_image' : last;
+  }
+
+  String _normalizeHandle(String value) {
+    return value.replaceAll(RegExp(r'[^0-9a-zA-Z@._+-]'), '').toLowerCase();
+  }
+
+  String _normalizePhoneForSms(String value) {
+    final trimmed = value.trim();
+    if (trimmed.isEmpty) {
+      return '';
+    }
+    final normalized = trimmed.replaceAll(RegExp(r'[^0-9+]'), '');
+    if (normalized.replaceAll('+', '').isEmpty) {
+      return '';
+    }
+    return normalized;
+  }
+
+  Future<bool> _openSmsComposer(List<String> recipients, String body) async {
+    if (recipients.isEmpty) {
+      return false;
+    }
+    final uri = Uri(
+      scheme: 'sms',
+      path: recipients.join(','),
+      queryParameters: {'body': body},
+    );
+    return launchUrl(uri, mode: LaunchMode.externalApplication);
   }
 
   Future<void> _openAlarmSheet({int? existingIndex}) async {
@@ -1020,6 +1765,91 @@ class NotificationDebugInfo {
   final String? lastError;
 }
 
+class PenaltyContact {
+  const PenaltyContact({required this.name, required this.handle});
+
+  final String name;
+  final String handle;
+
+  Map<String, dynamic> toJson() => {'name': name, 'handle': handle};
+
+  factory PenaltyContact.fromJson(Map<String, dynamic> json) {
+    return PenaltyContact(
+      name: (json['name'] ?? '').toString(),
+      handle: (json['handle'] ?? '').toString(),
+    );
+  }
+}
+
+class PenaltyImage {
+  const PenaltyImage({
+    required this.name,
+    required this.url,
+    this.isLocal = false,
+  });
+
+  final String name;
+  final String url;
+  final bool isLocal;
+
+  Map<String, dynamic> toJson() => {
+    'name': name,
+    'url': url,
+    'isLocal': isLocal,
+  };
+
+  factory PenaltyImage.fromJson(Map<String, dynamic> json) {
+    return PenaltyImage(
+      name: (json['name'] ?? '').toString(),
+      url: (json['url'] ?? '').toString(),
+      isLocal: (json['isLocal'] as bool?) ?? false,
+    );
+  }
+}
+
+class ImageBlastTarget {
+  const ImageBlastTarget({required this.contact, required this.image});
+
+  final PenaltyContact contact;
+  final PenaltyImage image;
+}
+
+class ImageBlastDispatch {
+  const ImageBlastDispatch({
+    required this.id,
+    required this.alarmLabel,
+    required this.triggeredAt,
+    required this.targets,
+    required this.deliveredCount,
+    required this.failedCount,
+    required this.status,
+  });
+
+  final String id;
+  final String alarmLabel;
+  final DateTime triggeredAt;
+  final List<ImageBlastTarget> targets;
+  final int deliveredCount;
+  final int failedCount;
+  final String status;
+
+  ImageBlastDispatch copyWith({
+    int? deliveredCount,
+    int? failedCount,
+    String? status,
+  }) {
+    return ImageBlastDispatch(
+      id: id,
+      alarmLabel: alarmLabel,
+      triggeredAt: triggeredAt,
+      targets: targets,
+      deliveredCount: deliveredCount ?? this.deliveredCount,
+      failedCount: failedCount ?? this.failedCount,
+      status: status ?? this.status,
+    );
+  }
+}
+
 class _Backdrop extends StatelessWidget {
   const _Backdrop();
 
@@ -1301,6 +2131,255 @@ class _ActionCard extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _StatusBadge extends StatelessWidget {
+  const _StatusBadge({
+    required this.label,
+    required this.tone,
+    required this.textColor,
+  });
+
+  final String label;
+  final Color tone;
+  final Color textColor;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: _brutalDecoration(
+        color: tone,
+        borderRadius: 999,
+        borderWidth: 1.8,
+        shadowOffset: const Offset(2, 2),
+      ),
+      child: Text(
+        label,
+        style: Theme.of(
+          context,
+        ).textTheme.labelMedium?.copyWith(color: textColor, letterSpacing: 0.3),
+      ),
+    );
+  }
+}
+
+class _SnoozeBlastCard extends StatelessWidget {
+  const _SnoozeBlastCard({
+    required this.enabled,
+    required this.contactCount,
+    required this.imageCount,
+    required this.latestDispatch,
+    required this.sending,
+    required this.lastStatus,
+    required this.onEnabledChanged,
+    required this.onManageContactsTap,
+    required this.onManageImagesTap,
+  });
+
+  final bool enabled;
+  final int contactCount;
+  final int imageCount;
+  final ImageBlastDispatch? latestDispatch;
+  final bool sending;
+  final String? lastStatus;
+  final ValueChanged<bool> onEnabledChanged;
+  final VoidCallback onManageContactsTap;
+  final VoidCallback onManageImagesTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: _brutalDecoration(
+        color: _Palette.paper,
+        borderRadius: 14,
+        borderWidth: 2,
+        shadowOffset: const Offset(5, 5),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Snooze consequence #1',
+                  style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                    color: _Palette.ink,
+                    fontSize: 24,
+                  ),
+                ),
+              ),
+              Switch(
+                value: enabled,
+                activeThumbColor: _Palette.paper,
+                activeTrackColor: _Palette.blood,
+                inactiveThumbColor: _Palette.ink,
+                inactiveTrackColor: _Palette.surface,
+                onChanged: onEnabledChanged,
+              ),
+            ],
+          ),
+          Row(
+            children: [
+              _StatusBadge(
+                label: enabled ? 'ON' : 'OFF',
+                tone: enabled ? _Palette.blood : _Palette.paperMuted,
+                textColor: enabled ? _Palette.paper : _Palette.ink,
+              ),
+              const SizedBox(width: 8),
+              const _StatusBadge(
+                label: 'AUTO SEND',
+                tone: _Palette.paperMuted,
+                textColor: _Palette.ink,
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'On snooze: pick 5 random contacts and blast 5 random images.',
+            style: Theme.of(
+              context,
+            ).textTheme.bodyMedium?.copyWith(color: _Palette.surface),
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                child: _PressButton(
+                  text: 'Contacts',
+                  color: _Palette.paper,
+                  textColor: _Palette.ink,
+                  onTap: onManageContactsTap,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _PressButton(
+                  text: 'Images',
+                  color: _Palette.paper,
+                  textColor: _Palette.ink,
+                  onTap: onManageImagesTap,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                child: _MiniStat(
+                  label: 'Contacts armed',
+                  value: '$contactCount',
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _MiniStat(label: 'Images loaded', value: '$imageCount'),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _MiniStat(
+                  label: 'Last trigger',
+                  value: latestDispatch == null
+                      ? 'Never'
+                      : _formatTime(latestDispatch!.triggeredAt),
+                ),
+              ),
+            ],
+          ),
+          if (sending || lastStatus != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              sending ? 'Sending blast payloads...' : (lastStatus ?? ''),
+              style: Theme.of(
+                context,
+              ).textTheme.bodySmall?.copyWith(color: _Palette.surface),
+            ),
+          ],
+          if (latestDispatch != null) ...[
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    'Latest blast (${latestDispatch!.alarmLabel})',
+                    style: Theme.of(
+                      context,
+                    ).textTheme.labelLarge?.copyWith(color: _Palette.ink),
+                  ),
+                ),
+                _StatusBadge(
+                  label: _statusLabel(latestDispatch!.status),
+                  tone: _statusTone(latestDispatch!.status),
+                  textColor: _statusTextColor(latestDispatch!.status),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'Delivered ${latestDispatch!.deliveredCount} • Failed ${latestDispatch!.failedCount}',
+              style: Theme.of(
+                context,
+              ).textTheme.bodySmall?.copyWith(color: _Palette.surface),
+            ),
+            const SizedBox(height: 4),
+            ...latestDispatch!.targets.map(
+              (target) => Padding(
+                padding: const EdgeInsets.only(bottom: 3),
+                child: Text(
+                  '${target.contact.name}  <-  ${target.image.name}',
+                  style: Theme.of(
+                    context,
+                  ).textTheme.bodySmall?.copyWith(color: _Palette.surface),
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _MiniStat extends StatelessWidget {
+  const _MiniStat({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(8),
+      decoration: _brutalDecoration(
+        color: _Palette.paperMuted,
+        borderRadius: 10,
+        borderWidth: 1.8,
+        shadowOffset: const Offset(2, 2),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label,
+            style: Theme.of(
+              context,
+            ).textTheme.labelSmall?.copyWith(color: _Palette.surface),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            value,
+            style: Theme.of(
+              context,
+            ).textTheme.titleMedium?.copyWith(color: _Palette.ink),
+          ),
+        ],
       ),
     );
   }
@@ -1713,4 +2792,41 @@ String _formatDuration(Duration duration) {
     return '$minutes min';
   }
   return '${hours}h ${minutes.toString().padLeft(2, '0')}m';
+}
+
+Color _statusTone(String status) {
+  switch (status) {
+    case 'sent':
+      return _Palette.paperMuted;
+    case 'partial':
+      return const Color(0xFFEFC16A);
+    case 'failed':
+      return _Palette.blood;
+    case 'sending':
+      return const Color(0xFF8AD9E7);
+    default:
+      return _Palette.paper;
+  }
+}
+
+Color _statusTextColor(String status) {
+  if (status == 'failed') {
+    return _Palette.paper;
+  }
+  return _Palette.ink;
+}
+
+String _statusLabel(String status) {
+  switch (status) {
+    case 'sent':
+      return 'SENT';
+    case 'partial':
+      return 'PARTIAL';
+    case 'failed':
+      return 'FAILED';
+    case 'sending':
+      return 'SENDING';
+    default:
+      return 'QUEUED';
+  }
 }

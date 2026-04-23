@@ -45,5 +45,9 @@
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<key>NSContactsUsageDescription</key>
+	<string>Morning Menace uses contacts for approved consequence recipients.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Morning Menace uses your selected photos as consequence image pool.</string>
 </dict>
 </plist>
