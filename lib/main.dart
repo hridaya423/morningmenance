@@ -387,14 +387,14 @@ class _AlarmDashboardScreenState extends State<AlarmDashboardScreen> {
   }
 
   List<AlarmItem> _defaultAlarms() {
-    return const [
-      AlarmItem(
+    return [
+      const AlarmItem(
         id: 'a1',
         time: TimeOfDay(hour: 6, minute: 30),
         label: 'Morning training',
         enabled: true,
       ),
-      AlarmItem(
+      const AlarmItem(
         id: 'a2',
         time: TimeOfDay(hour: 7, minute: 45),
         label: 'Work prep',
